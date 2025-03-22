@@ -50,8 +50,16 @@ def online_learning():
     df.fillna(0, inplace=True)
     df = df.reset_index(drop=True)
 
-    X = df.drop(['close'])
-    y = df['close']
+    df.rename(columns={
+        'open': 'Open',
+        'high': 'High',
+        'low': 'Low',
+        'close': 'Close',
+        'volume': 'Volume'
+    }, inplace=True)
+
+    X = df.drop(['Close'], axis=1)
+    y = df['Close']
 
     model = joblib.load(MODEL_PATH)
     model.fit(X, y, xgb_model=model.get_booster())
@@ -60,6 +68,4 @@ def online_learning():
 
 
 if __name__ == '__main__':
-    while True:
-        online_learning()
-        time.sleep(3600)
+    online_learning()
