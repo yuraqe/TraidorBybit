@@ -232,7 +232,7 @@ class TradeMachine:
             self.candles_30sec.append(new_candle)
             ln = len(self.candles_30sec)
             if ln < 15:
-                #logging.info(f"30sec свечей {ln}")
+                logging.info(f"30sec свечей {ln}")
                 continue
             df = pd.DataFrame(self.candles_30sec)
             df.rename(columns={
@@ -242,7 +242,6 @@ class TradeMachine:
                 'volume': 'Volume'
             }, inplace=True)
             df['close'] = df['close'].shift(-1)
-            df = df.dropna(subset=['close'])
 
             df['SMA14'] = TA.SMA(df, 14).shift(1)
             df['RSI14'] = TA.RSI(df).shift(1)
@@ -251,6 +250,7 @@ class TradeMachine:
             macd_df = TA.MACD(df).shift(1)
             df['MACD'] = macd_df['MACD']
             df['MACD_SIGNAL'] = macd_df['SIGNAL']
+            df.dropna(inplace=True)
 
             y_predictors = df.drop(['close'], axis=1).iloc[[-1]]
             y_prediction = self.modelRidge.predict(y_predictors)[0]
@@ -259,37 +259,30 @@ class TradeMachine:
             price_change = y_prediction - curr_price
             percent_change = (price_change / curr_price) * 100
             self.predict_result = percent_change
+            logging.info(f"Предикт: {y_prediction:.2f}, Текущая цена: {curr_price:.2f}")
 
             asyncio.create_task(
                 self.execute_trade_logic()
             )
 
-
     async def forming_30sec_candles(self):
         while True:
             new_candle = await self.candle_queue_1s.get()
             self.candles_1sec.append(new_candle)
+
             if len(self.candles_1sec) < 30:
                 continue
-            df = pd.DataFrame(list(self.candles_1sec))
+            df = pd.DataFrame(self.candles_1sec)
             self.candles_1sec.clear()
-
-            df.set_index('timestamp', inplace=True)
-
-            agg_dict = {
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last',
-                'volume': 'sum'
+            new_candle_30s = {
+                'timestamp': df['timestamp'].iloc[0],
+                'open': df['open'].iloc[0],
+                'high': df['high'].max(),
+                'low': df['low'].min(),
+                'close': df['close'].iloc[-1],
+                'volume': df['volume'].sum(),
             }
-
-            resampled = df.resample('30s').agg(agg_dict)
-
-            new_candle = resampled.iloc[0].to_dict()
-            await self.candle_queue_30s.put(new_candle)
-
-
+            await self.candle_queue_30s.put(new_candle_30s)
 
 
     async def forming_candles(self):
