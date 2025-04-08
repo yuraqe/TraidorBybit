@@ -7,35 +7,41 @@ import threading
 import pandas as pd
 import functools
 import logging
-
 from datetime import datetime, timezone
-from verification import BUCKET_NAME, KEYS_GCS_PATH, MODEL_PATH, BYBIT_SECRET_KEY, BYBIT_API_KEY
+
+from verification import BUCKET_NAME, KEYS_GCS_PATH, MODEL_PATH, BYBIT_SECRET_KEY, BYBIT_API_KEY, MODEL_PATH2, \
+    BYBIT_API_KEY_sub, BYBIT_SECRET_KEY_sub
 from google.cloud import storage
 from pybit.unified_trading import WebSocket
 from collections import deque
 from finta import TA
-from pybit.unified_trading import HTTP
+from pybit.unified_trading import HTTP as UnifiedHTTP
 
 
 class TradeMachine:
-    FEE_BUY = 0.00055    # 0.055 от маркет покупки
-    FEE_SELL = 0.0002    # 0.02 от лимтной продажи
 
-    def __init__(self, symbols, model, trade_client):
+    def __init__(self, symbols, model, trade_client, model2, second_client):
+        self.sub_model = model2
         self.symbol = symbols
         self.trades_buffer = []
         self.candles_1sec = []
+        self.candle_2 = []
         self.candle_queue_1s = asyncio.Queue()
+        self.candle_queue_2 = asyncio.Queue()
         self.candles_gcs = []
-        self.candles_30sec = deque(maxlen=15)
+        self.candles_1min = deque(maxlen=20)
+        self.candles_30sec = deque(maxlen=20)
         self.candle_queue_30s = asyncio.Queue()
+        self.candle_queue_1min = asyncio.Queue()
         self._buffer_lock = threading.Lock()
         self.current_price = None
         self.last_modified = os.path.getmtime(MODEL_PATH)
-        self.modelRidge = model
+        self.sub_last_modified = os.path.getmtime(MODEL_PATH2)
+        self.modelXGB = model
         self.trade_client = trade_client
+        self.sub_client = second_client
         self.predict_result = None
-        self.STOP_LOSS_PERCENT = 0.001  # 0.1% убытка
+        self.sub_predict_result = None
 
         logging.basicConfig(level=logging.INFO)
         # Запуск WebSocket (работает в отдельном потоке)
@@ -46,11 +52,16 @@ class TradeMachine:
         self.ws.trade_stream(symbol=self.symbol, callback=self.handle_trade)
 
 
-    async def get_available_balance(self, moneta):
+    async def get_available_balance(self, moneta, account=None):
+        if account == '1':
+            trade_client = self.trade_client
+        else:
+            trade_client = self.sub_client
+
         loop = asyncio.get_running_loop()
         try:
             wallet_info = await loop.run_in_executor(None, functools.partial(
-                self.trade_client.get_wallet_balance,
+                trade_client.get_wallet_balance,
                 accountType="UNIFIED",  # или другой тип, если ты используешь classic/contract
                 coin=moneta
             ))
@@ -61,51 +72,13 @@ class TradeMachine:
             return None
 
 
-    async def reset_position(self):
-        loop = asyncio.get_running_loop()
+    async def place_sell_order(self, qty, account):
+        if account == '1':
+            trade_client, present_predict, nap = self.trade_client, self.predict_result, 90
+        else:
+            trade_client, present_predict, nap = self.sub_client, self.sub_predict_result, 50
 
-        try:
-            # --- Отменяем все reduceOnly ордера (то есть твои TP) ---
-            orders = await loop.run_in_executor(None, functools.partial(
-                self.trade_client.get_open_orders,
-                category="linear",
-                symbol="ETHUSDT"
-            ))
-            open_orders = orders["result"]["list"]
-            tp_orders = [order for order in open_orders if order.get("reduceOnly")]
-
-            for order in tp_orders:
-                await loop.run_in_executor(None, functools.partial(
-                    self.trade_client.cancel_order,
-                    category="linear",
-                    symbol="ETHUSDT",
-                    orderId=order["orderId"]
-                ))
-            # --- Проверяем и закрываем открытую позицию, если есть ---
-            positions = await loop.run_in_executor(None, functools.partial(
-                self.trade_client.get_positions,
-                category="linear",
-                symbol="ETHUSDT"
-            ))
-            position = positions["result"]["list"][0]
-            size = float(position["size"])
-            side = position["side"]
-
-            if size > 0:
-                opposite = "Sell" if side == "Buy" else "Buy"
-                await loop.run_in_executor(None, functools.partial(
-                    self.trade_client.place_order,
-                    category="linear",
-                    symbol="ETHUSDT",
-                    side=opposite,
-                    orderType="Market",
-                    qty=str(size),
-                    reduceOnly=True
-                ))
-        except Exception as e:
-            logging.error(f"Ошибка в reset_position: {e}")
-
-    async def place_sell_order(self, qty, limit_price):
+        limit_price = round(self.current_price * (1 + present_predict / 100), 2)
         order = {
             "category": "linear",
             "symbol": self.symbol,
@@ -113,75 +86,80 @@ class TradeMachine:
             "orderType": "Limit",
             "qty": str(qty),
             "price": str(limit_price),
-            "reduceOnly": True,  # чтобы не открыть шорт
-            "timeInForce": "GoodTillCancel"
+            "timeInForce": "GTC",
+            "isPostOnly": True,
+            "reduceOnly": True,
         }
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(None, functools.partial(self.trade_client.place_order, **order))
-            #logging.info(f"Продажа ETH лимитным ордером размещена: {qty} по цене {limit_price}")
+            response = await loop.run_in_executor(None, functools.partial(trade_client.place_order, **order))
+            order_id = response['result']['orderId']
+
+            await asyncio.sleep(nap)
+
+            await loop.run_in_executor(None, functools.partial(
+                trade_client.cancel_order,
+                category="linear",
+                symbol=self.symbol,
+                orderId=order_id
+            ))
         except Exception as e:
-            logging.error(f"Ошибка при размещении ордера на продажу: {e}")
+            logging.warning(f"Не удалось отменить ордер (возможно, уже исполнен): {e}")
 
 
 
-    async def place_buy_order(self, qty):
+    async def place_buy_order(self, qty, account):
+        if account == '1':
+            trade_client, present_predict, nap = self.trade_client, self.predict_result, 90
+        else:
+            trade_client, present_predict, nap = self.sub_client, self.sub_predict_result, 50
+
+        limit_price = round(self.current_price * (1 + present_predict / 100), 2)
+
         order = {
             "category": "linear",
             "symbol": self.symbol,
             "side": "Buy",
-            "orderType": "Market",
-            "qty": str(qty),
-            "timeInForce": "GoodTillCancel"
-        }
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(None, functools.partial(self.trade_client.place_order, **order))
-            #logging.info(f"Ордер на покупку размещён: {order}")
-        except Exception as e:
-            logging.error(f"Ошибка при размещении ордера на покупку: {e}")
-
-        # --- TAKE-PROFIT ---
-        take_profit_price = round(self.current_price * (1 + self.predict_result / 100), 2)
-
-        tp_order = {
-            "category": "linear",
-            "symbol": self.symbol,
-            "side": "Sell",
             "orderType": "Limit",
             "qty": str(qty),
-            "price": str(take_profit_price),
-            "reduceOnly": True,
-            "timeInForce": "PostOnly"
+            "price": str(limit_price),
+            "timeInForce": "GTC",
+            "isPostOnly": True
         }
+
+        loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(None, functools.partial(self.trade_client.place_order, **tp_order))
-            #logging.info(f"Тейк-профит размещён: {tp_order}")
+            response = await loop.run_in_executor(None, functools.partial(trade_client.place_order, **order))
+            order_id = response["result"]["orderId"]
+
+            await asyncio.sleep(nap)
+
+            await loop.run_in_executor(None, functools.partial(
+                trade_client.cancel_order,
+                category="linear",
+                symbol=self.symbol,
+                orderId=order_id
+            ))
         except Exception as e:
-            logging.error(f"Ошибка при размещении тейк-профита: {e}")
+            logging.warning(f"Не удалось отменить ордер (возможно, уже исполнен): {e}")
 
 
-    async def execute_trade_logic(self):
-        quantity25 = max(round(25 / self.current_price, 2), 0.01)
-        quantity20 = max(round(20 / self.current_price, 2), 0.01)
-        usd = await self.get_available_balance('USDT')
-        eth = await self.get_available_balance('ETH')
-        if self.predict_result >= 0.15 and usd >= 25:
-            await self.reset_position()
-            await self.place_buy_order(quantity25)
-        elif self.predict_result >= 0.09 and usd >= 20:
-            await self.reset_position()
-            await self.place_buy_order(quantity20)
-
-        elif self.predict_result <= -0.15 and eth >= quantity25:
-            limit_price = round(self.current_price * (1 - abs(self.predict_result) / 100), 2)
-            await self.place_sell_order(quantity25, limit_price)
-        elif self.predict_result <= -0.09 and eth >= quantity20:
-            limit_price = round(self.current_price * (1 - abs(self.predict_result) / 100), 2)
-            await self.place_sell_order(quantity20, limit_price)
-
+    async def execute_trade_logic(self, account=None):
+        if account == '1':
+            present_predict =self.predict_result
         else:
-            logging.info("Сигнал недостаточно сильный для входа в сделку.")
+            present_predict = self.sub_predict_result
+        quantity20 = max(round(20 / self.current_price, 2), 0.01)
+
+        if present_predict <= -0.06:
+            usd = await self.get_available_balance('USDT', account)
+            if usd > 20:
+                await self.place_buy_order(quantity20, account)
+
+        elif present_predict >= 0.06:
+            eth = await self.get_available_balance('ETH', account)
+            if eth > quantity20:
+                await self.place_sell_order(quantity20, account)
 
 
     async def save_to_gcs(self):
@@ -219,11 +197,15 @@ class TradeMachine:
     async def check_model_update(self):
         while True:
             current_modified = os.path.getmtime(MODEL_PATH)
+            sub_current_modified = os.path.getmtime(MODEL_PATH2)
             if current_modified > self.last_modified:
                 self.modelXGB = await asyncio.to_thread(functools.partial(joblib.load, MODEL_PATH))
                 self.last_modified = current_modified
+            if sub_current_modified > self.sub_last_modified:
+                self.sub_model = await asyncio.to_thread(functools.partial(joblib.load, MODEL_PATH2))
+                self.sub_last_modified = sub_current_modified
             #logging.info("check_model_update спит ")
-            await asyncio.sleep(9600)
+            await asyncio.sleep(21600)
 
 
     async def preprocess_predict(self):
@@ -231,16 +213,11 @@ class TradeMachine:
             new_candle = await self.candle_queue_30s.get()
             self.candles_30sec.append(new_candle)
             ln = len(self.candles_30sec)
-            if ln < 15:
+            if ln < 16:
                 logging.info(f"30sec свечей {ln}")
                 continue
             df = pd.DataFrame(self.candles_30sec)
-            df.rename(columns={
-                'open': 'Open',
-                'high': 'High',
-                'low': 'Low',
-                'volume': 'Volume'
-            }, inplace=True)
+
             df['close'] = df['close'].shift(-1)
 
             df['SMA14'] = TA.SMA(df, 14).shift(1)
@@ -252,18 +229,79 @@ class TradeMachine:
             df['MACD_SIGNAL'] = macd_df['SIGNAL']
             df.dropna(inplace=True)
 
-            y_predictors = df.drop(['close'], axis=1).iloc[[-1]]
-            y_prediction = self.modelRidge.predict(y_predictors)[0]
+            df.rename(columns={
+                'open': 'Open',
+                'high': 'High',
+                'low': 'Low',
+                'volume': 'Volume'
+            }, inplace=True)
+
+            y_predictors = df.drop('close', axis=1).iloc[[-1]]
+            y_prediction = self.modelXGB.predict(y_predictors)[0]
 
             curr_price = self.current_price
             price_change = y_prediction - curr_price
             percent_change = (price_change / curr_price) * 100
             self.predict_result = percent_change
-            logging.info(f"Предикт: {y_prediction:.2f}, Текущая цена: {curr_price:.2f}")
 
             asyncio.create_task(
-                self.execute_trade_logic()
+                self.execute_trade_logic(account='1')
             )
+
+
+    async def preprocess_1min(self):
+        while True:
+            new_candle = await self.candle_queue_1min.get()
+            self.candles_1min.append(new_candle)
+            ln = len(self.candles_1min)
+            if ln < 16:
+                logging.info(f"1min свечей {ln}")
+                continue
+            df = pd.DataFrame(self.candles_1min)
+
+            df['close'] = df['close'].shift(-1)
+
+            df['SMA14'] = TA.SMA(df, 14).shift(1)
+            df['RSI14'] = TA.RSI(df).shift(1)
+            df['OBV14'] = TA.OBV(df).shift(1)
+            df['ATR14'] = TA.ATR(df, period=14).shift(1)
+            macd_df = TA.MACD(df).shift(1)
+            df['MACD'] = macd_df['MACD']
+            df['MACD_SIGNAL'] = macd_df['SIGNAL']
+            df.dropna(inplace=True)
+
+
+            y_predictors = df.drop('close', axis=1).iloc[[-1]]
+            y_prediction = self.sub_model.predict(y_predictors)[0]
+
+            curr_price = self.current_price
+            price_change = y_prediction - curr_price
+            percent_change = (price_change / curr_price) * 100
+            self.sub_predict_result = percent_change
+
+            asyncio.create_task(
+                self.execute_trade_logic(account='2')
+            )
+
+
+    async def forming_1min_candles(self):
+        while True:
+            new_candle = await self.candle_queue_2.get()
+            self.candle_2.append(new_candle)
+
+            if len(self.candle_2) < 60:
+                continue
+            df = pd.DataFrame(self.candle_2)
+            self.candle_2.clear()
+            new_candle_1min = {
+                'open': df['open'].iloc[0],
+                'high': df['high'].max(),
+                'low': df['low'].min(),
+                'close': df['close'].iloc[-1],
+                'volume': df['volume'].sum(),
+            }
+            await self.candle_queue_1min.put(new_candle_1min)
+
 
     async def forming_30sec_candles(self):
         while True:
@@ -275,7 +313,6 @@ class TradeMachine:
             df = pd.DataFrame(self.candles_1sec)
             self.candles_1sec.clear()
             new_candle_30s = {
-                'timestamp': df['timestamp'].iloc[0],
                 'open': df['open'].iloc[0],
                 'high': df['high'].max(),
                 'low': df['low'].min(),
@@ -322,6 +359,7 @@ class TradeMachine:
             }
             self.current_price = close_price
             await self.candle_queue_1s.put(candle)
+            await self.candle_queue_2.put(candle)
             self.candles_gcs.append(candle)
 
 
@@ -344,20 +382,22 @@ class TradeMachine:
             self.save_to_gcs(),
             self.forming_30sec_candles(),
             self.preprocess_predict(),
-            self.check_model_update()
+            self.preprocess_1min(),
+            self.check_model_update(),
+            self.forming_1min_candles()
         )
 
 
-client = HTTP(
+client1 = UnifiedHTTP(
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_SECRET_KEY,
     testnet=False
 )
-desired_leverage = "1"
-positions = client.get_positions(category="linear", symbol="ETHUSDT")
+desired_leverage = "10"
+positions = client1.get_positions(category="linear", symbol="ETHUSDT")
 current_leverage = positions["result"]["list"][0]["leverage"]
 if current_leverage != desired_leverage:
-    client.set_leverage(
+    client1.set_leverage(
         category="linear",
         symbol="ETHUSDT",
         buyLeverage=desired_leverage,
@@ -365,10 +405,29 @@ if current_leverage != desired_leverage:
     )
     print(f"Leverage set to {desired_leverage}x")
 
-modelRidge = joblib.load(MODEL_PATH)
+client2 = UnifiedHTTP(
+    api_key=BYBIT_API_KEY_sub,
+    api_secret=BYBIT_SECRET_KEY_sub,
+    testnet=False
+)
+desired_leverage = "10"
+positions = client2.get_positions(category="linear", symbol="ETHUSDT")
+current_leverage = positions["result"]["list"][0]["leverage"]
+if current_leverage != desired_leverage:
+    client2.set_leverage(
+        category="linear",
+        symbol="ETHUSDT",
+        buyLeverage=desired_leverage,
+        sellLeverage=desired_leverage
+    )
+    print(f"Leverage set to {desired_leverage}x")
+print("Client1 class:", type(client1))
+print("Client1 module:", client1.__class__.__module__)
+modelXGB = joblib.load(MODEL_PATH)
+second_model2 = joblib.load(MODEL_PATH2)
 
 # ETHUSDT   BTCUSDT
 if __name__ == '__main__':
     symbol = "ETHUSDT"
-    collector = TradeMachine(symbols=symbol, model=modelRidge, trade_client=client)
+    collector = TradeMachine(symbols=symbol, model=modelXGB, trade_client=client1, model2=second_model2, second_client=client2)
     asyncio.run(collector.run())
