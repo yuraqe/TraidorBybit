@@ -17,6 +17,7 @@ class CollectCandles:
         self.candles_gcs = []
         self.symbol = symbols
         logging.basicConfig(level=logging.INFO)
+        self.current_price = None
 
         # Запуск WebSocket (работает в отдельном потоке)
         self._buffer_lock = threading.Lock()
@@ -78,25 +79,28 @@ class CollectCandles:
             await self.sleep_until_next_second()
 
             with self._buffer_lock:
-                if not self.trades_buffer:
-                    continue
                 trades = self.trades_buffer.copy()
                 self.trades_buffer.clear()
+            if trades:
+                trades.sort(key=lambda x: x['timestamp'])
 
-            trades.sort(key=lambda x: x['timestamp'])
+                open_price = trades[0]['price']
+                close_price = trades[-1]['price']
+                self.current_price = close_price
 
-            open_price = trades[0]['price']
-            close_price = trades[-1]['price']
-
-            high_price = low_price = open_price
-            volume = 0
-            for trade in trades:
-                price = trade['price']
-                volume += trade['size']
-                if price > high_price:
-                    high_price = price
-                if price < low_price:
-                    low_price = price
+                high_price = low_price = open_price
+                volume = 0
+                for trade in trades:
+                    price = trade['price']
+                    volume += trade['size']
+                    if price > high_price:
+                        high_price = price
+                    if price < low_price:
+                        low_price = price
+            else:
+                price = self.current_price or 0.0
+                open_price = close_price = high_price = low_price = price
+                volume = 0.0
 
             candle = {
                 'timestamp': datetime.now(timezone.utc),
@@ -107,6 +111,7 @@ class CollectCandles:
                 'volume': volume,
             }
             self.candles_gcs.append(candle)
+
 
     async def run(self):
         """Запуск формирования свечей (WebSocket работает в фоне)"""
