@@ -48,7 +48,7 @@ class CollectCandles:
         while True:
             if self.candles_gcs:
                 current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                file_path = f"datasets/ETH-USDT_{current_date}.pkl"
+                file_path = f"datasets/HIGH-USDT_{current_date}.pkl"
                 blob = bucket.blob(file_path)
 
                 try:
@@ -132,6 +132,6 @@ class CollectCandles:
 
 
 if __name__ == '__main__':
-    symbol = "ETHUSDT"
+    symbol = "HIGHUSDT"
     collector = CollectCandles(symbols=symbol)
     asyncio.run(collector.run())
